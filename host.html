@@ -167,6 +167,11 @@
       .highlight {
         color: #a5b4fc;
       }
+      .seek-row {
+        display: flex;
+        gap: 8px;
+        margin-top: 4px;
+      }
     </style>
   </head>
   <body>
@@ -174,8 +179,8 @@
       <h1>Host – Preloaded Remote Audio Control</h1>
       <div class="subtitle">
         Your client downloads and buffers all the files from this site. You
-        remotely tell their browser which one to play. Switching is instant
-        because everything is preloaded.
+        remotely tell their browser which one to play. Switching and jumps are
+        instant because everything is preloaded.
       </div>
 
       <!-- ROOM SETUP -->
@@ -243,6 +248,20 @@
         <div class="button-row" style="margin-top: 10px">
           <button id="btn-play" disabled>Play</button>
           <button id="btn-pause" disabled>Pause</button>
+          <button id="btn-toggle-loop" disabled>Loop: Off</button>
+        </div>
+
+        <div class="status" style="margin-top: 12px">
+          <label for="seek-input">Jump to time (mm:ss or seconds)</label>
+          <div class="seek-row">
+            <input
+              id="seek-input"
+              type="text"
+              placeholder="e.g. 1:30 or 90"
+            />
+            <button id="btn-seek" disabled>Jump</button>
+          </div>
+          <div class="status small" id="seek-hint"></div>
         </div>
 
         <div class="status" style="margin-top: 10px">
@@ -261,7 +280,9 @@
           This page uses Firebase Realtime Database for control messages. Audio
           is streamed directly from this site (<code>audio/&ast;.mp3</code>) to
           each listener. Files are buffered locally on their side before
-          playback.
+          playback. Mobile browsers may still pause playback if the tab is fully
+          backgrounded; resuming the screen or tab will continue from the same
+          point.
         </p>
       </section>
     </div>
@@ -304,6 +325,10 @@
       const readyStatus = document.getElementById("ready-status");
       const btnPlay = document.getElementById("btn-play");
       const btnPause = document.getElementById("btn-pause");
+      const btnToggleLoop = document.getElementById("btn-toggle-loop");
+      const seekInput = document.getElementById("seek-input");
+      const btnSeek = document.getElementById("btn-seek");
+      const seekHint = document.getElementById("seek-hint");
       const trackListEl = document.getElementById("track-list");
       const activeTrackLabel = document.getElementById("active-track-label");
       const hostStatus = document.getElementById("host-status");
@@ -317,7 +342,13 @@
       const readyMap = {}; // id -> boolean
       let readyCount = 0;
 
-      let currentState = { activeTrackId: null, playing: false };
+      let currentState = {
+        activeTrackId: null,
+        playing: false,
+        loop: false,
+        seekTo: null,
+        seekVersion: 0
+      };
 
       function setHostConnectionStatus(online) {
         if (online) {
@@ -340,6 +371,35 @@
       function getAudioBaseUrl() {
         // Root site: https://sapphire-may.github.io/
         return window.location.origin + "/audio/";
+      }
+
+      function formatTime(seconds) {
+        seconds = Math.max(0, Math.floor(seconds));
+        const m = Math.floor(seconds / 60);
+        const s = seconds % 60;
+        return m + ":" + (s < 10 ? "0" + s : s);
+      }
+
+      function parseTimeInput(text) {
+        if (!text) return null;
+        const t = text.trim();
+        if (!t) return null;
+        if (t.includes(":")) {
+          const parts = t.split(":");
+          if (parts.length !== 2) return null;
+          const m = parseFloat(parts[0]);
+          const s = parseFloat(parts[1]);
+          if (isNaN(m) || isNaN(s)) return null;
+          return m * 60 + s;
+        } else {
+          const s = parseFloat(t);
+          if (isNaN(s)) return null;
+          return s;
+        }
+      }
+
+      function updateLoopButton() {
+        btnToggleLoop.textContent = currentState.loop ? "Loop: On" : "Loop: Off";
       }
 
       btnStartHost.addEventListener("click", async () => {
@@ -393,6 +453,50 @@
           "Track list sent. Waiting for buffers to fill.";
       });
 
+      btnToggleLoop.addEventListener("click", () => {
+        currentState.loop = !currentState.loop;
+        updateLoopButton();
+        if (roomRef) {
+          roomRef.child("state").update({
+            loop: currentState.loop
+          });
+        }
+        applyPlaybackState();
+      });
+
+      btnSeek.addEventListener("click", () => {
+        const value = seekInput.value;
+        const seconds = parseTimeInput(value);
+        if (seconds === null || seconds < 0) {
+          alert("Enter a time like 1:30 or 90");
+          return;
+        }
+        currentState.seekVersion = (currentState.seekVersion || 0) + 1;
+        currentState.seekTo = seconds;
+
+        // Apply locally
+        tracks.forEach((track) => {
+          const audio = audioMap[track.id];
+          if (!audio) return;
+          try {
+            audio.currentTime = seconds;
+          } catch (e) {
+            // ignore
+          }
+        });
+
+        if (roomRef) {
+          roomRef.child("state").update({
+            seekTo: seconds,
+            seekVersion: currentState.seekVersion
+          });
+        }
+
+        seekHint.textContent =
+          "Jumped to " + formatTime(seconds) + " in all tracks.";
+        applyPlaybackState();
+      });
+
       async function startHost(roomId) {
         setHostConnectionStatus(false);
         hostSetupStatus.textContent = "Connecting as host…";
@@ -430,8 +534,13 @@
           const val = snap.val() || {};
           currentState = {
             activeTrackId: val.activeTrackId || null,
-            playing: !!val.playing
+            playing: !!val.playing,
+            loop: !!val.loop,
+            seekTo:
+              typeof val.seekTo === "number" ? val.seekTo : null,
+            seekVersion: val.seekVersion || 0
           };
+          updateLoopButton();
           applyPlaybackState();
         });
       }
@@ -450,6 +559,7 @@
             audio = new Audio();
             audioMap[track.id] = audio;
             audio.preload = "auto";
+            audio.setAttribute("playsinline", "");
             audio.addEventListener("canplaythrough", () => {
               if (!readyMap[track.id]) {
                 readyMap[track.id] = true;
@@ -476,13 +586,17 @@
           readyStatus.textContent = "No tracks listed yet.";
           btnPlay.disabled = true;
           btnPause.disabled = true;
+          btnToggleLoop.disabled = true;
+          btnSeek.disabled = true;
           return;
         }
         readyStatus.textContent =
-          "Buffered tracks: " + readyCount + " / " + total;
+          "Buffered tracks (host side): " + readyCount + " / " + total;
         const anyReady = Object.values(readyMap).some(Boolean);
         btnPlay.disabled = !anyReady;
         btnPause.disabled = !anyReady;
+        btnToggleLoop.disabled = !anyReady;
+        btnSeek.disabled = !anyReady;
       }
 
       function renderTrackList() {
@@ -538,10 +652,12 @@
       function setActiveTrack(id) {
         if (!tracks.find((t) => t.id === id)) return;
         currentState.activeTrackId = id;
-        roomRef.child("state").update({
-          activeTrackId: id,
-          playing: currentState.playing
-        });
+        if (roomRef) {
+          roomRef.child("state").update({
+            activeTrackId: id,
+            playing: currentState.playing
+          });
+        }
         renderTrackList();
         if (currentState.playing) {
           hostStatus.textContent =
@@ -558,26 +674,36 @@
           currentState.activeTrackId = tracks[0].id;
         }
         currentState.playing = true;
-        roomRef.child("state").set(currentState);
+        if (roomRef) {
+          roomRef.child("state").update({
+            activeTrackId: currentState.activeTrackId,
+            playing: true
+          });
+        }
         hostStatus.textContent =
           "Play command sent. Listeners will start playback.";
         renderTrackList();
+        applyPlaybackState();
       });
 
       btnPause.addEventListener("click", () => {
         currentState.playing = false;
-        roomRef.child("state").update({
-          playing: false
-        });
+        if (roomRef) {
+          roomRef.child("state").update({
+            playing: false
+          });
+        }
         hostStatus.textContent =
           "Pause command sent. Listeners will stop playback.";
+        applyPlaybackState();
       });
 
       function applyPlaybackState() {
-        const { activeTrackId, playing } = currentState;
+        const { activeTrackId, playing, loop } = currentState;
         tracks.forEach((track) => {
           const audio = audioMap[track.id];
           if (!audio) return;
+          audio.loop = !!loop;
           if (
             playing &&
             track.id === activeTrackId &&
@@ -590,6 +716,14 @@
         });
         renderTrackList();
       }
+
+      document.addEventListener("visibilitychange", () => {
+        // If the tab comes back to foreground and we were supposed to be playing,
+        // make sure playback resumes.
+        if (!document.hidden && currentState.playing) {
+          applyPlaybackState();
+        }
+      });
     </script>
   </body>
 </html>

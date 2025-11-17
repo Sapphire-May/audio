@@ -127,7 +127,8 @@
         loop: false,
         seekTo: null,
         seekVersion: 0,
-        volume: 1
+        volume: 1,
+        livePosition: 0
       };
       const tracks = []; // { id, filename, label }
       const audioMap = {}; // id -> HTMLAudioElement
@@ -136,6 +137,8 @@
       let userInteraction = true; // assume allowed; fall back if autoplay fails
       let autoplayFailed = false;
       let lastSeekVersion = 0;
+      let syncedToLive = false;
+      let lastLivePosition = null;
 
       function getRoomIdFromQuery() {
         const params = new URLSearchParams(
@@ -152,7 +155,6 @@
         const total = tracks.length;
         const anyReady = Object.values(readyMap).some(Boolean);
 
-        // No tracks from mistress yet
         if (!total) {
           btnStartAudio.disabled = true;
           listenerStatus.textContent =
@@ -160,16 +162,13 @@
           return;
         }
 
-        // Tracks exist but still buffering
         if (!anyReady) {
           listenerStatus.textContent = "Preparing audio…";
           btnStartAudio.disabled = true;
           return;
         }
 
-        // Tracks buffered here, depends on autoplay / user interaction / playing state
         if (!currentState.playing) {
-          // Mistress hasn't hit play yet
           if (autoplayFailed && !userInteraction) {
             listenerStatus.textContent =
               "Waiting for your mistress… then tap “Start listening” if it’s silent.";
@@ -183,13 +182,10 @@
           return;
         }
 
-        // Mistress is playing
         if (!autoplayFailed && userInteraction) {
-          // Audio should be going
           listenerStatus.textContent = "";
           btnStartAudio.disabled = true;
         } else {
-          // Autoplay was blocked, they still need to tap
           listenerStatus.textContent =
             "Tap “Start listening” to hear your mistress.";
           btnStartAudio.disabled = false;
@@ -213,6 +209,7 @@
           delete readyMap[id];
         }
         readyCount = 0;
+        syncedToLive = false;
 
         const base = getAudioBaseUrl();
 
@@ -231,6 +228,18 @@
             if (!readyMap[id]) {
               readyMap[id] = true;
               readyCount++;
+              // If this is the active track and we have a live position, sync once
+              if (
+                !syncedToLive &&
+                currentState.playing &&
+                currentState.activeTrackId === id &&
+                typeof lastLivePosition === "number"
+              ) {
+                try {
+                  audio.currentTime = lastLivePosition;
+                  syncedToLive = true;
+                } catch (e) {}
+              }
               updateReadyStatus();
             }
           });
@@ -273,6 +282,21 @@
           audio.loop = !!loop;
           audio.volume = vol;
 
+          // If we haven't synced to live yet and we have a live position,
+          // try to do that before playing.
+          if (
+            !syncedToLive &&
+            playing &&
+            activeTrackId === track.id &&
+            typeof lastLivePosition === "number" &&
+            readyMap[track.id]
+          ) {
+            try {
+              audio.currentTime = lastLivePosition;
+              syncedToLive = true;
+            } catch (e) {}
+          }
+
           if (
             userInteraction &&
             playing &&
@@ -283,8 +307,6 @@
             audio
               .play()
               .then(() => {
-                // If we're actually playing and userInteraction is allowed,
-                // clear status text (no more "preparing").
                 if (currentState.playing && userInteraction) {
                   listenerStatus.textContent = "";
                   btnStartAudio.disabled = true;
@@ -305,12 +327,9 @@
         });
 
         if (!anyTryingToPlay) {
-          // Not currently playing anything
           if (currentState.playing) {
-            // Mistress *wants* it playing but maybe it's not ready yet
             updateReadyStatus();
           } else {
-            // Paused state
             updateReadyStatus();
           }
         }
@@ -341,12 +360,21 @@
             typeof val.volume === "number"
               ? val.volume
               : currentState.volume ?? 1;
+          const incomingLive =
+            typeof val.livePosition === "number"
+              ? val.livePosition
+              : null;
+
+          if (incomingLive !== null) {
+            lastLivePosition = incomingLive;
+          }
 
           if (
             incomingSeek !== null &&
             incomingVersion > lastSeekVersion
           ) {
             lastSeekVersion = incomingVersion;
+            syncedToLive = false; // allow a new live sync after a hard seek
             tracks.forEach((track) => {
               const audio = audioMap[track.id];
               if (!audio) return;
@@ -362,8 +390,13 @@
             loop: !!val.loop,
             seekTo: incomingSeek,
             seekVersion: incomingVersion,
-            volume: incomingVolume
+            volume: incomingVolume,
+            livePosition:
+              typeof incomingLive === "number"
+                ? incomingLive
+                : currentState.livePosition
           };
+
           applyPlaybackState();
           updateReadyStatus();
         });

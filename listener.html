@@ -76,14 +76,15 @@
   </head>
   <body>
     <div class="app">
-      <h1>Listen.</h1>
+      <h1>Listening</h1>
       <div class="subtitle">
-        Your mistress is in control.
+        Your mistress is in control. Audio should start on its own; if it
+        doesn’t, tap the button once and keep listening.
       </div>
 
       <section class="card">
         <button id="btn-start-audio" disabled>
-          Start listening.
+          Start listening
         </button>
         <div class="status" id="listener-status">
           Preparing audio…
@@ -99,7 +100,6 @@
     <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-database-compat.js"></script>
 
     <script>
-      // ---- Firebase setup ----
       const firebaseConfig = {
         apiKey: "AIzaSyCPHd62hm96T9kcy1ZqWUhFu1WN8A0Mwj4",
         authDomain: "audio-8c1f6.firebaseapp.com",
@@ -113,12 +113,10 @@
       firebase.initializeApp(firebaseConfig);
       const db = firebase.database();
 
-      // ---- DOM ----
       const listenerStatus = document.getElementById("listener-status");
       const btnStartAudio = document.getElementById("btn-start-audio");
       const audioContainer = document.getElementById("audio-container");
 
-      // ---- State ----
       let roomRef = null;
 
       let currentState = {
@@ -135,12 +133,14 @@
       const audioMap = {}; // id -> HTMLAudioElement
       const readyMap = {}; // id -> boolean
 
-      let userInteraction = true;   // assume allowed until browser complains
-      let autoplayFailed = false;   // set to true if play() is blocked
+      let userInteraction = true;   // becomes false if autoplay is blocked
+      let autoplayFailed = false;
       let lastSeekVersion = 0;
-      let syncedToLive = false;     // have we aligned to livePosition yet?
 
-      // ---- Helpers ----
+      // We use this to decide whether we've already "started" the active track.
+      // On the first real play (or after a seek/track change), we hard-sync to livePosition.
+      let hasPlayedActiveOnce = false;
+
       function getRoomIdFromQuery() {
         const params = new URLSearchParams(window.location.search);
         return params.get("room");
@@ -155,21 +155,18 @@
         const anyReady = Object.values(readyMap).some(Boolean);
         const hostPlaying = !!currentState.playing;
 
-        // No tracks at all yet
         if (!total) {
           btnStartAudio.disabled = true;
           listenerStatus.textContent = "Waiting for your mistress…";
           return;
         }
 
-        // Tracks defined but still buffering
         if (!anyReady) {
           btnStartAudio.disabled = true;
           listenerStatus.textContent = "Preparing audio…";
           return;
         }
 
-        // Tracks ready, host not playing
         if (!hostPlaying) {
           btnStartAudio.disabled = true;
           listenerStatus.textContent = "Waiting for your mistress…";
@@ -178,37 +175,16 @@
 
         // Host is playing
         if (autoplayFailed && !userInteraction) {
-          // Browser blocked autoplay — stable "tap once" state
           btnStartAudio.disabled = false;
           listenerStatus.textContent =
-            "";
+            "Tap “Start listening” to hear your mistress.";
         } else {
-          // Autoplay should be working or user has already interacted
           btnStartAudio.disabled = true;
           listenerStatus.textContent = "";
         }
       }
 
-      function trySyncToLive() {
-        const id = currentState.activeTrackId;
-        if (!id) return;
-        if (syncedToLive) return;
-        if (typeof currentState.livePosition !== "number") return;
-        if (!readyMap[id]) return;
-
-        const audio = audioMap[id];
-        if (!audio) return;
-
-        try {
-          audio.currentTime = currentState.livePosition;
-          syncedToLive = true;
-        } catch (e) {
-          // ignore seek errors
-        }
-      }
-
       function loadTracksFromFirebase(tracksObj) {
-        // Reset local audio
         tracks.length = 0;
         for (const id in audioMap) {
           const el = audioMap[id];
@@ -218,7 +194,7 @@
           delete audioMap[id];
           delete readyMap[id];
         }
-        syncedToLive = false;
+        hasPlayedActiveOnce = false;
 
         const base = getAudioBaseUrl();
 
@@ -236,8 +212,6 @@
           audio.addEventListener("canplaythrough", () => {
             if (!readyMap[id]) {
               readyMap[id] = true;
-              // If this is the current active track and host is playing, snap to live
-              trySyncToLive();
               updateReadyStatus();
             }
           });
@@ -260,15 +234,33 @@
         updateReadyStatus();
       }
 
+      function syncActiveTrackToLive(audio) {
+        const target = typeof currentState.livePosition === "number"
+          ? currentState.livePosition
+          : null;
+
+        if (target === null) return;
+
+        const cur = isFinite(audio.currentTime) ? audio.currentTime : 0;
+        const diff = Math.abs(cur - target);
+
+        // Only correct if we've never played this active track,
+        // or if we drift more than ~1.5 seconds.
+        if (!hasPlayedActiveOnce || diff > 1.5) {
+          try {
+            audio.currentTime = target;
+          } catch (e) {
+            // ignore
+          }
+        }
+      }
+
       function applyPlaybackState() {
         const { activeTrackId, playing, loop, volume } = currentState;
         const vol =
           typeof volume === "number"
             ? Math.max(0, Math.min(1, volume))
             : 1;
-
-        // Before we try to play, make sure we've lined up with mistress's position
-        trySyncToLive();
 
         let attemptedPlay = false;
 
@@ -285,16 +277,19 @@
             track.id === activeTrackId &&
             readyMap[track.id]
           ) {
+            // Before playing, snap closer to mistress's livePosition
+            syncActiveTrackToLive(audio);
+
             attemptedPlay = true;
             audio
               .play()
               .then(() => {
-                // Autoplay worked
+                hasPlayedActiveOnce = true;
                 listenerStatus.textContent = "";
                 btnStartAudio.disabled = true;
+                updateReadyStatus();
               })
               .catch(() => {
-                // Browser blocked autoplay
                 if (!autoplayFailed) {
                   autoplayFailed = true;
                   userInteraction = false;
@@ -306,20 +301,17 @@
           }
         });
 
-        // If nothing is actually trying to play yet, still keep UI stable
         if (!attemptedPlay) {
-          updateReadyStatus();
-        } else {
-          // If we did attempt play, updateReadyStatus may need to reflect new state
           updateReadyStatus();
         }
       }
 
-      // ---- Event wiring ----
       btnStartAudio.addEventListener("click", () => {
         userInteraction = true;
-        autoplayFailed = false; // we got the tap, we can try again freely
+        autoplayFailed = false; // they just gave us a fresh gesture
         listenerStatus.textContent = "";
+        // On first manual start, re-allow a hard sync to live
+        hasPlayedActiveOnce = false;
         applyPlaybackState();
       });
 
@@ -327,7 +319,6 @@
         listenerStatus.textContent = "Waiting for your mistress…";
         roomRef = db.ref("rooms").child(roomId);
 
-        // Track list
         roomRef.child("tracks").on("value", (snap) => {
           const val = snap.val();
           if (!val) {
@@ -338,7 +329,6 @@
           loadTracksFromFirebase(val);
         });
 
-        // Playback state
         roomRef.child("state").on("value", (snap) => {
           const val = snap.val() || {};
           const incomingVersion = val.seekVersion || 0;
@@ -353,13 +343,13 @@
               ? val.livePosition
               : null;
 
-          // Hard seeks (mistress jumps the timeline)
-          if (
-            incomingSeek !== null &&
-            incomingVersion > lastSeekVersion
-          ) {
+          const oldActive = currentState.activeTrackId;
+          const newActive = val.activeTrackId || null;
+
+          // If mistress jumps somewhere explicitly, obey that exactly.
+          if (incomingSeek !== null && incomingVersion > lastSeekVersion) {
             lastSeekVersion = incomingVersion;
-            syncedToLive = true; // this seek *is* the authoritative position
+            hasPlayedActiveOnce = false; // next play should align cleanly
             tracks.forEach((track) => {
               const audio = audioMap[track.id];
               if (!audio) return;
@@ -369,24 +359,13 @@
             });
           }
 
-          // If we get a new live position while playing, let that be the target
-          if (incomingLive !== null) {
-            currentState.livePosition = incomingLive;
-            // if host is playing and we haven't synced yet (new joiner / new track),
-            // we'll snap to this in trySyncToLive()
-            if (!currentState.playing) {
-              // keep but don't force resync immediately when paused
-            }
-            // Do NOT force syncedToLive = false here; that is handled when
-            // activeTrackId or seekVersion changes.
+          // Track change: allow a fresh sync on that new active track
+          if (newActive !== oldActive) {
+            hasPlayedActiveOnce = false;
           }
 
-          const oldActive = currentState.activeTrackId;
-          const newActive = val.activeTrackId || null;
-
-          // If mistress switched tracks, we need to resync live on the new one
-          if (newActive !== oldActive) {
-            syncedToLive = false;
+          if (incomingLive !== null) {
+            currentState.livePosition = incomingLive;
           }
 
           currentState = {
@@ -423,11 +402,3 @@
     </script>
   </body>
 </html>
-
-
-
-
-
-
-
-

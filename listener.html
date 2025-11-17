@@ -1,0 +1,340 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Listening – Preloaded Remote Audio</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <style>
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        margin: 0;
+        font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI",
+          sans-serif;
+        background: #020617;
+        color: #e5e7eb;
+      }
+      .app {
+        max-width: 640px;
+        margin: 0 auto;
+        padding: 24px 16px 40px;
+        text-align: center;
+      }
+      h1 {
+        font-size: 1.7rem;
+        margin-bottom: 6px;
+      }
+      .subtitle {
+        opacity: 0.8;
+        margin-bottom: 16px;
+        font-size: 0.95rem;
+      }
+      .card {
+        background: rgba(15, 23, 42, 0.9);
+        border-radius: 18px;
+        border: 1px solid rgba(148, 163, 184, 0.4);
+        padding: 18px 20px;
+        margin-bottom: 16px;
+        box-shadow: 0 18px 40px rgba(15, 23, 42, 0.7);
+      }
+      .status {
+        font-size: 0.9rem;
+        opacity: 0.9;
+        margin-top: 6px;
+      }
+      .pill {
+        display: inline-flex;
+        align-items: center;
+        border-radius: 999px;
+        padding: 4px 10px;
+        font-size: 0.8rem;
+        border: 1px solid rgba(148, 163, 184, 0.6);
+        gap: 6px;
+      }
+      .pill-dot {
+        width: 7px;
+        height: 7px;
+        border-radius: 999px;
+        background: #ef4444;
+      }
+      .pill-dot.online {
+        background: #22c55e;
+      }
+      button {
+        font-family: inherit;
+        border-radius: 999px;
+        border: 1px solid rgba(148, 163, 184, 0.7);
+        background: rgba(15, 23, 42, 0.9);
+        color: #e5e7eb;
+        padding: 9px 18px;
+        font-size: 0.95rem;
+        cursor: pointer;
+        transition:
+          border-color 0.15s ease,
+          transform 0.05s ease;
+        margin-top: 12px;
+      }
+      button:hover {
+        border-color: rgba(148, 163, 184, 1);
+        transform: translateY(-1px);
+      }
+      button:disabled {
+        opacity: 0.4;
+        cursor: default;
+        transform: none;
+      }
+      .small {
+        font-size: 0.8rem;
+        opacity: 0.75;
+      }
+      audio {
+        display: none;
+      }
+      .bar {
+        margin-top: 10px;
+        font-size: 0.85rem;
+        opacity: 0.85;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="app">
+      <h1>Listening</h1>
+      <div class="subtitle">
+        Your engineer is controlling what you hear. All the audio is preloaded
+        from this site to avoid buffering when switching tracks.
+      </div>
+
+      <section class="card">
+        <div class="status">
+          Connection:
+          <span class="pill">
+            <span class="pill-dot" id="conn-dot"></span>
+            <span id="conn-text">Connecting…</span>
+          </span>
+        </div>
+
+        <div class="status" id="listener-status" style="margin-top: 10px">
+          Looking for the host and track list…
+        </div>
+
+        <div class="bar" id="buffer-status"></div>
+
+        <button id="btn-start-audio" disabled>
+          Start listening
+        </button>
+
+        <div class="status small" style="margin-top: 10px">
+          Click the button once when it becomes active. After that, your
+          engineer handles all playback and switching.
+        </div>
+      </section>
+
+      <!-- Hidden audio elements will be created by JS -->
+      <div id="audio-container" style="display: none"></div>
+    </div>
+
+    <!-- Firebase compat builds -->
+    <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-database-compat.js"></script>
+
+    <script>
+      // Same Firebase config as in host.html
+const firebaseConfig = {
+  apiKey: "AIzaSyCPHd62hm96T9kcy1ZqWUhFu1WN8A0Mwj4",
+  authDomain: "audio-8c1f6.firebaseapp.com",
+  projectId: "audio-8c1f6",
+  storageBucket: "audio-8c1f6.firebasestorage.app",
+  messagingSenderId: "313094779274",
+  appId: "1:313094779274:web:8394e80c777f11fd6e9873"
+};
+      };
+
+      firebase.initializeApp(firebaseConfig);
+      const db = firebase.database();
+
+      const connDot = document.getElementById("conn-dot");
+      const connText = document.getElementById("conn-text");
+      const listenerStatus =
+        document.getElementById("listener-status");
+      const bufferStatus =
+        document.getElementById("buffer-status");
+      const btnStartAudio =
+        document.getElementById("btn-start-audio");
+      const audioContainer =
+        document.getElementById("audio-container");
+
+      let roomRef = null;
+      let currentState = { activeTrackId: null, playing: false };
+      const tracks = []; // { id, filename, label }
+      const audioMap = {}; // id -> HTMLAudioElement
+      const readyMap = {}; // id -> boolean
+      let readyCount = 0;
+      let userInteraction = false;
+
+      function setConnectionStatus(online) {
+        if (online) {
+          connDot.classList.add("online");
+          connText.textContent = "Connected";
+        } else {
+          connDot.classList.remove("online");
+          connText.textContent = "Not connected";
+        }
+      }
+
+      function getRoomIdFromQuery() {
+        const params = new URLSearchParams(
+          window.location.search
+        );
+        return params.get("room");
+      }
+
+      function getAudioBaseUrl() {
+        const basePath = window.location.pathname.replace(
+          /[^/]+$/,
+          ""
+        );
+        return window.location.origin + basePath + "audio/";
+      }
+
+      function updateBufferStatus() {
+        const total = tracks.length;
+        if (!total) {
+          bufferStatus.textContent = "";
+          btnStartAudio.disabled = true;
+          return;
+        }
+        bufferStatus.textContent =
+          "Buffered tracks: " + readyCount + " / " + total;
+        const anyReady = Object.values(readyMap).some(Boolean);
+        // Allow the user to click once we have at least one ready
+        btnStartAudio.disabled = !anyReady;
+      }
+
+      btnStartAudio.addEventListener("click", () => {
+        userInteraction = true;
+        listenerStatus.textContent =
+          "Listening. The host controls what you hear.";
+        applyPlaybackState(); // try to start whatever the host wants
+      });
+
+      function loadTracksFromFirebase(tracksObj) {
+        tracks.length = 0;
+        for (const id in audioMap) {
+          const el = audioMap[id];
+          if (el && el.parentNode === audioContainer) {
+            audioContainer.removeChild(el);
+          }
+          delete audioMap[id];
+          delete readyMap[id];
+        }
+        readyCount = 0;
+
+        const base = getAudioBaseUrl();
+
+        for (const id in tracksObj) {
+          const t = tracksObj[id];
+          const filename = t.filename;
+          const label = t.label || filename;
+          tracks.push({ id, filename, label });
+
+          const audio = document.createElement("audio");
+          audio.preload = "auto";
+          audio.src = base + filename;
+
+          audio.addEventListener("canplaythrough", () => {
+            if (!readyMap[id]) {
+              readyMap[id] = true;
+              readyCount++;
+              updateBufferStatus();
+            }
+          });
+
+          audio.addEventListener("error", () => {
+            listenerStatus.textContent =
+              "Error loading " +
+              filename +
+              ". Please tell your host.";
+          });
+
+          audioMap[id] = audio;
+          audioContainer.appendChild(audio);
+          audio.load();
+        }
+
+        if (!tracks.length) {
+          listenerStatus.textContent =
+            "Host has not provided any tracks yet.";
+        } else {
+          listenerStatus.textContent =
+            "Downloading and buffering tracks from the host’s site…";
+        }
+        updateBufferStatus();
+      }
+
+      function applyPlaybackState() {
+        const { activeTrackId, playing } = currentState;
+        tracks.forEach((track) => {
+          const audio = audioMap[track.id];
+          if (!audio) return;
+          if (
+            userInteraction &&
+            playing &&
+            track.id === activeTrackId &&
+            readyMap[track.id]
+          ) {
+            audio
+              .play()
+              .catch(() => {
+                // if blocked, user can click Start again
+              });
+          } else {
+            audio.pause();
+          }
+        });
+      }
+
+      function startListener(roomId) {
+        listenerStatus.textContent =
+          'Connecting as listener for room "' +
+          roomId +
+          '"…';
+        roomRef = db.ref("rooms").child(roomId);
+        setConnectionStatus(true);
+
+        // Track list
+        roomRef.child("tracks").on("value", (snap) => {
+          const val = snap.val();
+          if (!val) {
+            listenerStatus.textContent =
+              "No track list from host yet.";
+            return;
+          }
+          loadTracksFromFirebase(val);
+        });
+
+        // Playback state
+        roomRef.child("state").on("value", (snap) => {
+          const val = snap.val() || {};
+          currentState = {
+            activeTrackId: val.activeTrackId || null,
+            playing: !!val.playing
+          };
+          applyPlaybackState();
+        });
+      }
+
+      // Boot
+      const roomId = getRoomIdFromQuery();
+      if (!roomId) {
+        listenerStatus.textContent =
+          "Missing room ID in the link. Ask your host for a correct link.";
+        connText.textContent = "No room";
+        btnStartAudio.disabled = true;
+      } else {
+        startListener(roomId);
+      }
+    </script>
+  </body>
+</html>

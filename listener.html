@@ -100,6 +100,7 @@
     <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-database-compat.js"></script>
 
     <script>
+      // ---- Firebase setup ----
       const firebaseConfig = {
         apiKey: "AIzaSyCPHd62hm96T9kcy1ZqWUhFu1WN8A0Mwj4",
         authDomain: "audio-8c1f6.firebaseapp.com",
@@ -113,33 +114,36 @@
       firebase.initializeApp(firebaseConfig);
       const db = firebase.database();
 
-      const listenerStatus =
-        document.getElementById("listener-status");
-      const btnStartAudio =
-        document.getElementById("btn-start-audio");
-      const audioContainer =
-        document.getElementById("audio-container");
+      // ---- DOM ----
+      const listenerStatus = document.getElementById("listener-status");
+      const btnStartAudio = document.getElementById("btn-start-audio");
+      const audioContainer = document.getElementById("audio-container");
 
+      // ---- State ----
       let roomRef = null;
+
       let currentState = {
         activeTrackId: null,
         playing: false,
         loop: false,
         seekTo: null,
-        seekVersion: 0
+        seekVersion: 0,
+        volume: 1,
+        livePosition: 0
       };
+
       const tracks = []; // { id, filename, label }
       const audioMap = {}; // id -> HTMLAudioElement
       const readyMap = {}; // id -> boolean
-      let readyCount = 0;
-      let userInteraction = true; // assume allowed; fall back if autoplay fails
-      let autoplayFailed = false;
-      let lastSeekVersion = 0;
 
+      let userInteraction = true;   // assume allowed until browser complains
+      let autoplayFailed = false;   // set to true if play() is blocked
+      let lastSeekVersion = 0;
+      let syncedToLive = false;     // have we aligned to livePosition yet?
+
+      // ---- Helpers ----
       function getRoomIdFromQuery() {
-        const params = new URLSearchParams(
-          window.location.search
-        );
+        const params = new URLSearchParams(window.location.search);
         return params.get("room");
       }
 
@@ -150,59 +154,62 @@
       function updateReadyStatus() {
         const total = tracks.length;
         const anyReady = Object.values(readyMap).some(Boolean);
+        const hostPlaying = !!currentState.playing;
 
-        // No tracks from mistress yet
+        // No tracks at all yet
         if (!total) {
           btnStartAudio.disabled = true;
-          listenerStatus.textContent =
-            "Waiting for your mistress…";
+          listenerStatus.textContent = "Waiting for your mistress…";
           return;
         }
 
-        // Tracks exist but still buffering
+        // Tracks defined but still buffering
         if (!anyReady) {
+          btnStartAudio.disabled = true;
           listenerStatus.textContent = "Preparing audio…";
-          btnStartAudio.disabled = true;
           return;
         }
 
-        // Tracks buffered here, depends on autoplay / user interaction / playing state
-        if (!currentState.playing) {
-          // Mistress hasn't hit play yet
-          if (autoplayFailed && !userInteraction) {
-            listenerStatus.textContent =
-              "Waiting for your mistress… then tap “Start listening” if it’s silent.";
-            btnStartAudio.disabled = false;
-          } else {
-            listenerStatus.textContent =
-              "Waiting for your mistress…";
-            btnStartAudio.disabled = autoplayFailed && !userInteraction
-              ? false
-              : true;
-          }
+        // Tracks ready, host not playing
+        if (!hostPlaying) {
+          btnStartAudio.disabled = true;
+          listenerStatus.textContent = "Waiting for your mistress…";
           return;
         }
 
-        // Mistress is playing
-        if (!autoplayFailed && userInteraction) {
-          // Audio should be going; no need to spam text
-          listenerStatus.textContent = "";
-          btnStartAudio.disabled = true;
-        } else {
-          // Autoplay was blocked, they still need to tap
+        // Host is playing
+        if (autoplayFailed && !userInteraction) {
+          // Browser blocked autoplay — stable "tap once" state
+          btnStartAudio.disabled = false;
           listenerStatus.textContent =
             "Tap “Start listening” to hear your mistress.";
-          btnStartAudio.disabled = false;
+        } else {
+          // Autoplay should be working or user has already interacted
+          btnStartAudio.disabled = true;
+          listenerStatus.textContent = "";
         }
       }
 
-      btnStartAudio.addEventListener("click", () => {
-        userInteraction = true;
-        listenerStatus.textContent = "";
-        applyPlaybackState();
-      });
+      function trySyncToLive() {
+        const id = currentState.activeTrackId;
+        if (!id) return;
+        if (syncedToLive) return;
+        if (typeof currentState.livePosition !== "number") return;
+        if (!readyMap[id]) return;
+
+        const audio = audioMap[id];
+        if (!audio) return;
+
+        try {
+          audio.currentTime = currentState.livePosition;
+          syncedToLive = true;
+        } catch (e) {
+          // ignore seek errors
+        }
+      }
 
       function loadTracksFromFirebase(tracksObj) {
+        // Reset local audio
         tracks.length = 0;
         for (const id in audioMap) {
           const el = audioMap[id];
@@ -212,7 +219,7 @@
           delete audioMap[id];
           delete readyMap[id];
         }
-        readyCount = 0;
+        syncedToLive = false;
 
         const base = getAudioBaseUrl();
 
@@ -230,7 +237,8 @@
           audio.addEventListener("canplaythrough", () => {
             if (!readyMap[id]) {
               readyMap[id] = true;
-              readyCount++;
+              // If this is the current active track and host is playing, snap to live
+              trySyncToLive();
               updateReadyStatus();
             }
           });
@@ -246,8 +254,7 @@
         }
 
         if (!tracks.length) {
-          listenerStatus.textContent =
-            "Waiting for your mistress…";
+          listenerStatus.textContent = "Waiting for your mistress…";
         } else {
           listenerStatus.textContent = "Preparing audio…";
         }
@@ -255,13 +262,23 @@
       }
 
       function applyPlaybackState() {
-        const { activeTrackId, playing, loop } = currentState;
-        let anyTryingToPlay = false;
+        const { activeTrackId, playing, loop, volume } = currentState;
+        const vol =
+          typeof volume === "number"
+            ? Math.max(0, Math.min(1, volume))
+            : 1;
+
+        // Before we try to play, make sure we've lined up with mistress's position
+        trySyncToLive();
+
+        let attemptedPlay = false;
 
         tracks.forEach((track) => {
           const audio = audioMap[track.id];
           if (!audio) return;
+
           audio.loop = !!loop;
+          audio.volume = vol;
 
           if (
             userInteraction &&
@@ -269,70 +286,81 @@
             track.id === activeTrackId &&
             readyMap[track.id]
           ) {
-            anyTryingToPlay = true;
+            attemptedPlay = true;
             audio
               .play()
               .then(() => {
-                // If we're actually playing and userInteraction is allowed,
-                // clear status text (no more "preparing").
-                if (currentState.playing && userInteraction) {
-                  listenerStatus.textContent = "";
-                  btnStartAudio.disabled = true;
-                }
+                // Autoplay worked
+                listenerStatus.textContent = "";
+                btnStartAudio.disabled = true;
               })
               .catch(() => {
+                // Browser blocked autoplay
                 if (!autoplayFailed) {
                   autoplayFailed = true;
                   userInteraction = false;
-                  btnStartAudio.disabled = false;
-                  listenerStatus.textContent =
-                    "Tap “Start listening” to hear your mistress.";
                 }
+                updateReadyStatus();
               });
           } else {
             audio.pause();
           }
         });
 
-        if (!anyTryingToPlay) {
-          // Not currently playing anything
-          if (currentState.playing) {
-            // Mistress *wants* it playing but maybe it's not ready yet
-            updateReadyStatus();
-          } else {
-            // Paused state
-            updateReadyStatus();
-          }
+        // If nothing is actually trying to play yet, still keep UI stable
+        if (!attemptedPlay) {
+          updateReadyStatus();
+        } else {
+          // If we did attempt play, updateReadyStatus may need to reflect new state
+          updateReadyStatus();
         }
       }
 
+      // ---- Event wiring ----
+      btnStartAudio.addEventListener("click", () => {
+        userInteraction = true;
+        autoplayFailed = false; // we got the tap, we can try again freely
+        listenerStatus.textContent = "";
+        applyPlaybackState();
+      });
+
       function startListener(roomId) {
-        listenerStatus.textContent =
-          "Waiting for your mistress…";
+        listenerStatus.textContent = "Waiting for your mistress…";
         roomRef = db.ref("rooms").child(roomId);
 
+        // Track list
         roomRef.child("tracks").on("value", (snap) => {
           const val = snap.val();
           if (!val) {
-            listenerStatus.textContent =
-              "Waiting for your mistress…";
+            listenerStatus.textContent = "Waiting for your mistress…";
             btnStartAudio.disabled = true;
             return;
           }
           loadTracksFromFirebase(val);
         });
 
+        // Playback state
         roomRef.child("state").on("value", (snap) => {
           const val = snap.val() || {};
           const incomingVersion = val.seekVersion || 0;
           const incomingSeek =
             typeof val.seekTo === "number" ? val.seekTo : null;
+          const incomingVolume =
+            typeof val.volume === "number"
+              ? val.volume
+              : currentState.volume ?? 1;
+          const incomingLive =
+            typeof val.livePosition === "number"
+              ? val.livePosition
+              : null;
 
+          // Hard seeks (mistress jumps the timeline)
           if (
             incomingSeek !== null &&
             incomingVersion > lastSeekVersion
           ) {
             lastSeekVersion = incomingVersion;
+            syncedToLive = true; // this seek *is* the authoritative position
             tracks.forEach((track) => {
               const audio = audioMap[track.id];
               if (!audio) return;
@@ -342,15 +370,40 @@
             });
           }
 
+          // If we get a new live position while playing, let that be the target
+          if (incomingLive !== null) {
+            currentState.livePosition = incomingLive;
+            // if host is playing and we haven't synced yet (new joiner / new track),
+            // we'll snap to this in trySyncToLive()
+            if (!currentState.playing) {
+              // keep but don't force resync immediately when paused
+            }
+            // Do NOT force syncedToLive = false here; that is handled when
+            // activeTrackId or seekVersion changes.
+          }
+
+          const oldActive = currentState.activeTrackId;
+          const newActive = val.activeTrackId || null;
+
+          // If mistress switched tracks, we need to resync live on the new one
+          if (newActive !== oldActive) {
+            syncedToLive = false;
+          }
+
           currentState = {
-            activeTrackId: val.activeTrackId || null,
+            activeTrackId: newActive,
             playing: !!val.playing,
             loop: !!val.loop,
             seekTo: incomingSeek,
-            seekVersion: incomingVersion
+            seekVersion: incomingVersion,
+            volume: incomingVolume,
+            livePosition:
+              typeof incomingLive === "number"
+                ? incomingLive
+                : currentState.livePosition
           };
+
           applyPlaybackState();
-          updateReadyStatus();
         });
       }
 
